@@ -1,4 +1,7 @@
-#include "BluetoothSerial.h"
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
 //PIN GPIO15: SEÑAL DE ENCENDIDO (ON/OFF) "PIN TDO"
 
@@ -8,18 +11,20 @@ RTC_DATA_ATTR boolean despierto = false;  //VARIABLE PARA EVITAR QUE EL SISTEMA 
 #define uS_TO_S_FACTOR 1000000ULL
 #define TIME_TO_SLEEP 5 // segundos
 
-void print_wakeup_reason() {
+#define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
+#define CHARACTERISTIC_RX  "12345678-1234-1234-1234-1234567890ac"
+#define CHARACTERISTIC_TX  "12345678-1234-1234-1234-1234567890ad"
 
+
+void print_wakeup_reason() {
   esp_sleep_wakeup_cause_t wakeup_reason;
   wakeup_reason = esp_sleep_get_wakeup_cause();
 
   switch (wakeup_reason) {
     case ESP_SLEEP_WAKEUP_TIMER:
-      Serial.println("desperto por tiempo");
-      Serial.println("luz encendida");
+      //Serial.println("desperto por tiempo");
       int led_rojo = 25;
       pinMode(led_rojo, OUTPUT);
-
       digitalWrite(led_rojo, HIGH);
       delay(300);
       digitalWrite(led_rojo, LOW);
@@ -36,11 +41,7 @@ void print_wakeup_reason() {
   }
 }
 
-#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
-#endif
-
-BluetoothSerial SerialBT;
+TaskHandle_t comunicacion;
 
 int principal = 27;  //PIN GPIO PARA EL CONTROL DEL ENCENDIDO COMPLETO DE LA MOTOCICLETA
 int sirena = 4;
@@ -48,36 +49,84 @@ int direccion = 32;  //PIN GPIO PARA LA ACTIVACION DE LAS DIRECCIONALES
 int led_rojo = 25;   //PIN GPIO PARA EL CONTROL DE LA LLAVE ROJA DEL TABLERO
 int lm2596 = 26;
 
-TaskHandle_t comunicacion;
+BLECharacteristic *txCharacteristic;
+bool deviceConnected = false;
+bool conexionValida = false;
+String mensajeRecibido = ""; // buffer global
 
 long long claveCifrada = 0LL;
 long claveDinamica = 0;
+int desplazamiento = 0;
 int claveDinamicaDescifrada[5];
 int clave[4];
 
 int estadoActual = 0;
+int contadorPaquetesPerdidos = 0;
 
-int desplazamiento = 0;
-
-bool conexionValida = false;
-bool procesoEncender = false;
 bool procesoParpadeo = true;
+bool procesoEncender = false;
+bool procesoAlarma = false;
 
 int ArrayA[] = { 6, 2, 5, 1, 4, 9, 8, 7, 3 };  // Desplazar X+Num de la izquierda a la derecha
 int ArrayB[] = { 2, 9, 8, 4, 6, 1, 5, 3, 7 };
 int ArrayC[] = { 5, 3, 6, 7, 2, 9, 4, 8, 1 };
 
-void callback_function(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
-  if (event == ESP_SPP_START_EVT) {
-    Serial.println("Inicializado SPP");
-  } else if (event == ESP_SPP_SRV_OPEN_EVT) {
-    Serial.println("Cliente conectado");
-    SerialBT.println(claveCifrada);
-  } else if (event == ESP_SPP_CLOSE_EVT) {
-    Serial.println("Cliente desconectado");
-    procesoApagado(3);
+
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("✅ Cliente conectado");
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("❌ Cliente desconectado");
+    pServer->startAdvertising();
+  }
+};
+
+
+class RecibirMensajeBLE : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    mensajeRecibido = pCharacteristic->getValue();
+    //Serial.println(mensajeRecibido.length());
+    //Serial.println(mensajeRecibido);
+
+    if (mensajeRecibido.length() == 5) {
+      if (validarClaveDinamica(claveDinamica, mensajeRecibido, clave[1])) {
+        Serial.println("Validación Correcta");
+        if (conexionValida == false) {
+          conexionValida = true;
+          estadoActual = 2;
+          procesoEncender = true;
+        }
+        contadorPaquetesPerdidos = 0;
+      } else {
+        Serial.println("Validación Fallida");
+      }
+    } else if (mensajeRecibido.length() == 3) {
+      if (mensajeRecibido == "301") {
+        procesoApagado(2);
+        EnviarMensajeBLE("301Y");
+      } else if (mensajeRecibido == "302") {
+        alarma();
+      }
+    }
+  }
+};
+
+
+void EnviarMensajeBLE(String mensaje) {
+  if (deviceConnected) {
+    txCharacteristic->setValue(mensaje);
+    txCharacteristic->notify();
+    Serial.print("📤 Mensaje enviado: ");
+    Serial.println(mensaje);
+  } else {
+    Serial.print("No hay cliente conectado... Error al enviar mensaje");
   }
 }
+
 
 void setup() {
   Serial.begin(115200);
@@ -85,10 +134,10 @@ void setup() {
   print_wakeup_reason();
   esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
 
+  dormir();
   Serial.println();
   Serial.println("............BIENVENIDO............");
   Serial.println("CONTROL DE ENCENDIDO KTM 390");
-  dormir();
 
   pinMode(principal, OUTPUT);
   pinMode(direccion, OUTPUT);
@@ -102,11 +151,10 @@ void setup() {
   digitalWrite(lm2596, LOW);
   digitalWrite(sirena, LOW);
 
-  SerialBT.begin("ESP32");  //NOMBRE COMO SE HARA VISIBLE EL DISPOSITIVO BLUETOOTH
-  Serial.println("EL DISPOSTIVO SE INICIO, YA ES POSIBLE USAR EL BLUETOOTH");
+  generarClaveInicial();
 
-
-  SerialBT.register_callback(callback_function);  // Registramos la función "callback_function"
+  Serial.println("Iniciando BLE...");
+  IniciarBLE();
 
   xTaskCreatePinnedToCore(
     loop_comunicacion,
@@ -116,8 +164,37 @@ void setup() {
     0,
     &comunicacion,
     0);
+}
 
-  generarClaveInicial();
+
+void IniciarBLE() {
+  BLEDevice::init("ESP32_BLE_TEST");
+
+  BLEServer *server = BLEDevice::createServer();
+  server->setCallbacks(new ServerCallbacks());
+
+  BLEService *service = server->createService(SERVICE_UUID);
+
+  // Característica TX (ESP32 → cliente)
+  txCharacteristic = service->createCharacteristic(
+    CHARACTERISTIC_TX,
+    BLECharacteristic::PROPERTY_NOTIFY);
+  txCharacteristic->addDescriptor(new BLE2902());
+
+  // Característica RX (cliente → ESP32)
+  BLECharacteristic *rxCharacteristic = service->createCharacteristic(
+    CHARACTERISTIC_RX,
+    BLECharacteristic::PROPERTY_WRITE);
+  rxCharacteristic->setCallbacks(new RecibirMensajeBLE());
+
+  service->start();
+
+  BLEAdvertising *advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->start();
+
+  Serial.println("📡 Advertencia BLE iniciada");
 }
 
 
@@ -134,7 +211,6 @@ int ciclosdireccion = 0;
 int ciclossirena = 0;
 
 void loop() {
-
   //if (analogRead(15) < 400) {
   if (digitalRead(15) == LOW) {
     procesoApagado(1);
@@ -202,6 +278,7 @@ void loop() {
   delay(10);
 }
 
+
 void dormir() {
   if (despierto == false) {
     bootNum++;  //INCREMENTA CADA VEZ QUE SE DESPIERTA
@@ -215,79 +292,53 @@ void dormir() {
   }
 }
 
+
 void loop_comunicacion(void *pvParameters) {
   unsigned long tiempoAnterior = 0;
   unsigned long frecuencia = 1000;
   int contador = 0;
-  int contadorPaquetesPerdidos = 0;
+  
 
   while (1) {
 
-    String mensajeRecibido = "";
+    // while (Serial.available()) {
+    //   char c = Serial.read();
 
-    while (Serial.available()) {
-      char c = Serial.read();
+    //   if (c == '\n') {  // Detecta el fin de mensaje
+    //     Serial.print("Mensaje Recibido: ");
+    //     Serial.println(mensajeRecibido);
+    //     //SerialBT.println(mensajeRecibido); /////////////////////////////////////////////////////////////////////////////////////////
 
-      if (c == '\n') {  // Detecta el fin de mensaje
-        Serial.print("Mensaje Recibido: ");
-        Serial.println(mensajeRecibido);
-        SerialBT.println(mensajeRecibido);
+    //     if (estadoActual == 0 && mensajeRecibido == "200") {
+    //       mensajeRecibido = "";
+    //       estadoActual = 1;
+    //     } else if (mensajeRecibido.length() == 5) {
+    //       if (validarClaveDinamica(claveDinamica, mensajeRecibido, clave[1])) {
+    //         contadorPaquetesPerdidos = 0;
+    //       }
+    //     }
+    //   } else {
+    //     mensajeRecibido += c;  // Acumula carácter
+    //   }
+    // }
+        
 
-        if (estadoActual == 0 && mensajeRecibido == "200") {
-          mensajeRecibido = "";
-          estadoActual = 1;
-        } else if (mensajeRecibido.length() == 5) {
-          if (validarClaveDinamica(claveDinamica, mensajeRecibido, clave[1])) {
-            contadorPaquetesPerdidos = 0;
-          }
-        }
-      } else {
-        mensajeRecibido += c;  // Acumula carácter
-      }
+    if (deviceConnected == true && estadoActual == 0) {
+      delay(1000);
+      EnviarMensajeBLE(String(claveCifrada));
+      estadoActual = 1;
     }
-
-    while (SerialBT.available()) {
-      char c = SerialBT.read();
-
-      if (c == '\n') {  // Detecta el fin de mensaje
-        //Serial.print("Mensaje Recibido: ");
-        //Serial.println(mensajeRecibido);
-
-        if (estadoActual == 0 && mensajeRecibido == "200") {
-          mensajeRecibido = "";
-          estadoActual = 1;
-        } else if (mensajeRecibido == "301") {
-          procesoApagado(2);
-          SerialBT.println("301Y");
-        } else if (mensajeRecibido == "302") {
-          alarma();
-        } else if (mensajeRecibido.length() == 5) {
-          if (validarClaveDinamica(claveDinamica, mensajeRecibido, clave[1])) {
-            Serial.println("Validación Correcta");
-            if (conexionValida == false) {
-              conexionValida = true;
-              estadoActual = 2;
-              procesoEncender = true;
-            }
-            contadorPaquetesPerdidos = 0;
-          } else {
-            Serial.println("Validación Fallida");
-          }
-        }
-      } else {
-        mensajeRecibido += c;  // Acumula carácter
-      }
-    }
-
-    if (estadoActual == 1) {
+    
+    if (estadoActual == 1 && mensajeRecibido == "200") {
+      delay(100);
       GenerarClaveDinamica();
-      estadoActual = 0;
+      estadoActual = 2;
     } else if (estadoActual == 2) {
       if (millis() - tiempoAnterior >= frecuencia) {
         tiempoAnterior = millis();
         contador++;
       }
-      if (contador >= 5) {
+      if (contador >= 10) {
         Serial.println("\n\n\n\n");
         Serial.print("ContadorPerdidos: ");
         Serial.println(contadorPaquetesPerdidos);
@@ -302,6 +353,7 @@ void loop_comunicacion(void *pvParameters) {
     delay(20);
   }
 }
+
 
 bool generarClaveInicial() {
 
@@ -363,50 +415,39 @@ bool generarClaveInicial() {
   }
 }
 
-void GenerarClaveDinamica() {
 
+void GenerarClaveDinamica() {
   int digitos = 0;
   claveDinamica = 0;
-  long copiaClaveDinamica = 0;
-  int arrayclaveDinamica[5];
 
   while (digitos != 5) {
-
-    digitos = 0;
-    claveDinamica = 0;
-
     for (int i = 0; i < 5; i++) {
-      int digito = random(1, 10);  // Dígito aleatorio entre 0 y 9
+      int digito = random(1, 10);  // Dígito aleatorio entre 1 y 9
       claveDinamica = claveDinamica * 10 + digito;
-      if (digito != 0) {
-        digitos++;
-      }
+      digitos++;
     }
   }
-  SerialBT.println(claveDinamica);
+  EnviarMensajeBLE(String(claveDinamica));
 }
 
+
 bool validarClaveDinamica(long claveDinamica, String mensajeRecibido, int claveA) {
-  //Serial.println("................Validacion Claves................");
+  
   Serial.print("Clave Dinamica: ");
   Serial.println(claveDinamica);
-  Serial.print("mensaje Recibido: ");
-  Serial.println(mensajeRecibido);
-
-  //claveDinamica = 79328;
-  //claveA = 7;
 
   int i = 4;
-  long copiaclaveDinamica = claveDinamica;
-  while (copiaclaveDinamica > 0) {
-    claveDinamicaDescifrada[i] = copiaclaveDinamica % 10;
-    copiaclaveDinamica /= 10;
+  while (claveDinamica > 0) {
+    claveDinamicaDescifrada[i] = claveDinamica % 10;
+    claveDinamica /= 10;
     i--;
   }
 
+  //claveDinamica = 79328;
+  //claveA = 7;
   // claveDinamica  = { 7, 9, 3, 2, 8 }
   // ArrayA[] = { 6, 2, 5, 1, 4, 9, 8, 7, 3 }; // Desplazar a la derecha la cantidad de veces del numero a la izquierda + la clave
-  // claveDinamicaF = { 9, 2, 8, 5, 8 }
+  // claveDinamicaF = { 9, 2, 8, 5, 8 }  
 
   int arrayMensajeOriginal[5];  // Para guardar el mensaje original
 
@@ -429,7 +470,6 @@ bool validarClaveDinamica(long claveDinamica, String mensajeRecibido, int claveA
           desplazamiento -= 9;
         }
         claveDinamicaDescifrada[i] = ArrayA[desplazamiento];
-
         break;
       }
     }
@@ -438,20 +478,19 @@ bool validarClaveDinamica(long claveDinamica, String mensajeRecibido, int claveA
   for (int i = 1; i < 5; i++) {
     claveDinamicaDescifrada[0] = claveDinamicaDescifrada[0] * 10 + claveDinamicaDescifrada[i];
   }
-  Serial.print("Mensaje Descifrado: ");
-  Serial.println(claveDinamicaDescifrada[0]);
-
+  Serial.print("Comparación: "); Serial.print(claveDinamicaDescifrada[0]); Serial.print(" - "); Serial.println(mensajeRecibido);
   if (claveDinamicaDescifrada[0] == mensajeRecibido.toInt()) return true;
   else return false;
 }
 
+
 void procesoApagado(int tipo) {
+  int contadorApagado = 0;
+  int T_LedApagdo = 0;
+  int estadoledApagado = false;
   if (tipo == 1) {
     Serial.println("Motivo Apagado: 1 - Switch");
     digitalWrite(principal, LOW);
-    int contadorApagado = 0;
-    int T_LedApagdo = 0;
-    int estadoledApagado = false;
     while (contadorApagado < 3) {
       if (millis() >= T_LedApagdo + 200) {
         if (estadoledApagado == false) {
@@ -477,9 +516,6 @@ void procesoApagado(int tipo) {
   } else if (tipo == 2) {
     Serial.println("Motivo Apagado: 2 - Señal de apagado remoto");
     digitalWrite(principal, LOW);
-    int contadorApagado = 0;
-    int T_LedApagdo = 0;
-    int estadoledApagado = false;
     while (contadorApagado < 2) {
       if (millis() >= T_LedApagdo + 200) {
         if (estadoledApagado == false) {
@@ -504,7 +540,6 @@ void procesoApagado(int tipo) {
   }
 }
 
-bool procesoAlarma = false;
 
 void alarma() {
   Serial.println("Iniciando Proceso de Alarma");

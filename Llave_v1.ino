@@ -16,6 +16,19 @@ RTC_DATA_ATTR boolean despierto = false;  //VARIABLE PARA EVITAR QUE EL SISTEMA 
 #define CHARACTERISTIC_TX  "12345678-1234-1234-1234-1234567890ad"
 
 
+void dormir() {
+  if (despierto == false) {
+    bootNum++;  //INCREMENTA CADA VEZ QUE SE DESPIERTA
+    Serial.println("numero de boot: " + String(bootNum));
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_15, 1);  //DETERMINA EL PIN GPIO RTC QUE DESPERTARA EL SISTEMA, 1 = High, 0 = Low
+    Serial.println("..........Modo Deep Sleep..........");
+    Serial.flush();
+    despierto = true;
+    esp_deep_sleep_start();
+    Serial.println("...............EL SISTEMA NO ENTRO EN MODO DEEP SLEEP...............");  //SI SE DUERME CORRECTAMENTE ESTA LINEA NO DEBERIA IMPRIMIRSE
+  }
+}
+
 void print_wakeup_reason() {
   esp_sleep_wakeup_cause_t wakeup_reason;
   wakeup_reason = esp_sleep_get_wakeup_cause();
@@ -66,6 +79,7 @@ int contadorPaquetesPerdidos = 0;
 bool procesoParpadeo = true;
 bool procesoEncender = false;
 bool procesoAlarma = false;
+bool estadoMotor = true;
 
 int ArrayA[] = { 6, 2, 5, 1, 4, 9, 8, 7, 3 };  // Desplazar X+Num de la izquierda a la derecha
 int ArrayB[] = { 2, 9, 8, 4, 6, 1, 5, 3, 7 };
@@ -82,6 +96,7 @@ class ServerCallbacks : public BLEServerCallbacks {
     deviceConnected = false;
     Serial.println("❌ Cliente desconectado");
     pServer->startAdvertising();
+    procesoApagado(3);
   }
 };
 
@@ -106,10 +121,17 @@ class RecibirMensajeBLE : public BLECharacteristicCallbacks {
       }
     } else if (mensajeRecibido.length() == 3) {
       if (mensajeRecibido == "301") {
-        procesoApagado(2);
+        if (estadoMotor == true){
+          procesoApagado(2);
+          estadoMotor = false;
+        } else {
+          procesoEncender = true;
+          estadoMotor = true;
+        }
         EnviarMensajeBLE("301Y");
       } else if (mensajeRecibido == "302") {
         alarma();
+        EnviarMensajeBLE("302Y");
       }
     }
   }
@@ -202,6 +224,7 @@ unsigned long T = 0;
 unsigned long T_Led = 0;
 unsigned long T_Direccion = 0;
 unsigned long T_Sirena = 0;
+unsigned long T_Alarma = 0;
 
 bool estadoled = false;
 bool estadodireccion = true;
@@ -273,23 +296,27 @@ void loop() {
       Serial.println("Encendiendo led");
       digitalWrite(led_rojo, HIGH);
       procesoEncender = false;
+      T = 0;
     }
   }
+
+  if (procesoAlarma == true) {
+    if (millis() >= T_Alarma + 15000) {
+      digitalWrite(principal, LOW);
+      for (int i = 0; i < 40; i++) {
+        if (i == 20)
+          digitalWrite(sirena, HIGH);
+        digitalWrite(led_rojo, HIGH);
+        delay(250);
+        digitalWrite(led_rojo, LOW);
+        delay(250);
+      }
+      digitalWrite(sirena, LOW);
+      ESP.restart();
+    }
+  } else T_Alarma = millis();
+
   delay(10);
-}
-
-
-void dormir() {
-  if (despierto == false) {
-    bootNum++;  //INCREMENTA CADA VEZ QUE SE DESPIERTA
-    Serial.println("numero de boot: " + String(bootNum));
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_15, 1);  //DETERMINA EL PIN GPIO RTC QUE DESPERTARA EL SISTEMA, 1 = High, 0 = Low
-    Serial.println("..........Modo Deep Sleep..........");
-    Serial.flush();
-    despierto = true;
-    esp_deep_sleep_start();
-    Serial.println("...............EL SISTEMA NO ENTRO EN MODO DEEP SLEEP...............");  //SI SE DUERME CORRECTAMENTE ESTA LINEA NO DEBERIA IMPRIMIRSE
-  }
 }
 
 
@@ -297,38 +324,14 @@ void loop_comunicacion(void *pvParameters) {
   unsigned long tiempoAnterior = 0;
   unsigned long frecuencia = 1000;
   int contador = 0;
-  
 
   while (1) {
-
-    // while (Serial.available()) {
-    //   char c = Serial.read();
-
-    //   if (c == '\n') {  // Detecta el fin de mensaje
-    //     Serial.print("Mensaje Recibido: ");
-    //     Serial.println(mensajeRecibido);
-    //     //SerialBT.println(mensajeRecibido); /////////////////////////////////////////////////////////////////////////////////////////
-
-    //     if (estadoActual == 0 && mensajeRecibido == "200") {
-    //       mensajeRecibido = "";
-    //       estadoActual = 1;
-    //     } else if (mensajeRecibido.length() == 5) {
-    //       if (validarClaveDinamica(claveDinamica, mensajeRecibido, clave[1])) {
-    //         contadorPaquetesPerdidos = 0;
-    //       }
-    //     }
-    //   } else {
-    //     mensajeRecibido += c;  // Acumula carácter
-    //   }
-    // }
-        
-
     if (deviceConnected == true && estadoActual == 0) {
       delay(1000);
       EnviarMensajeBLE(String(claveCifrada));
       estadoActual = 1;
     }
-    
+
     if (estadoActual == 1 && mensajeRecibido == "200") {
       delay(100);
       GenerarClaveDinamica();
@@ -338,11 +341,11 @@ void loop_comunicacion(void *pvParameters) {
         tiempoAnterior = millis();
         contador++;
       }
-      if (contador >= 10) {
+      if (contador >= 5) {
         Serial.println("\n\n\n\n");
         Serial.print("ContadorPerdidos: ");
         Serial.println(contadorPaquetesPerdidos);
-        if(contadorPaquetesPerdidos >= 3) {
+        if (contadorPaquetesPerdidos >= 3) {
           procesoApagado(3);
         }
         GenerarClaveDinamica();
@@ -356,13 +359,11 @@ void loop_comunicacion(void *pvParameters) {
 
 
 bool generarClaveInicial() {
-
   int digitos = 0;
   long long copiaClaveCifrada = 0LL;
   int arrayclaveCifrada[15];
 
   while (digitos != 15) {
-
     digitos = 0;
     claveCifrada = 0;
 
@@ -432,7 +433,6 @@ void GenerarClaveDinamica() {
 
 
 bool validarClaveDinamica(long claveDinamica, String mensajeRecibido, int claveA) {
-  
   Serial.print("Clave Dinamica: ");
   Serial.println(claveDinamica);
 
@@ -489,7 +489,7 @@ void procesoApagado(int tipo) {
   int T_LedApagdo = 0;
   int estadoledApagado = false;
   if (tipo == 1) {
-    Serial.println("Motivo Apagado: 1 - Switch");
+    Serial.println("Motivo De Apagado: 1 - Switch");
     digitalWrite(principal, LOW);
     while (contadorApagado < 3) {
       if (millis() >= T_LedApagdo + 200) {
@@ -514,7 +514,7 @@ void procesoApagado(int tipo) {
     despierto = false;
     dormir();
   } else if (tipo == 2) {
-    Serial.println("Motivo Apagado: 2 - Señal de apagado remoto");
+    Serial.println("Motivo De Apagado: 2 - Señal de apagado remoto");
     digitalWrite(principal, LOW);
     while (contadorApagado < 2) {
       if (millis() >= T_LedApagdo + 200) {
@@ -535,29 +535,15 @@ void procesoApagado(int tipo) {
       }
     }
   } else if (tipo == 3) {
-    Serial.println("Motivo Apagado: 3 - Desconexión, Perdida de paquetes");
+    Serial.println("Motivo De Apagado: 3 - Desconexión, Perdida de paquetes");
     alarma();
   }
 }
 
 
 void alarma() {
-  Serial.println("Iniciando Proceso de Alarma");
   if (procesoAlarma == false) {
+    Serial.println("Iniciando Proceso de Alarma");
     procesoAlarma = true;
-    while (1) {
-      delay(15000);
-      digitalWrite(principal, LOW);
-      for (int i = 0; i < 40; i++) {
-        digitalWrite(led_rojo, HIGH);
-        if (i == 20)
-          digitalWrite(sirena, HIGH);
-        delay(250);
-        digitalWrite(led_rojo, LOW);
-        delay(250);
-      }
-      digitalWrite(sirena, LOW);
-      ESP.restart();
-    }
-  }
+  } else Serial.println("Alarma Ya Iniciada...");
 }
